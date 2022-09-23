@@ -152,6 +152,8 @@ void CloseStdout() {
 }
 
 void Printf(const char *Fmt, ...) {
+  if (!OutputFile)
+    return;
   va_list ap;
   va_start(ap, Fmt);
   vfprintf(OutputFile, Fmt, ap);

@@ -13,6 +13,7 @@
 
 #include "FuzzerDefs.h"
 #include "FuzzerDictionary.h"
+#include "FuzzerTraceMemory.h"
 #include "FuzzerValueBitMap.h"
 
 #include <set>
@@ -30,17 +31,42 @@ namespace fuzzer {
 template<class T, size_t kSizeT>
 struct TableOfRecentCompares {
   static const size_t kSize = kSizeT;
+  size_t NumEntries = 0;
+
   struct Pair {
     T A, B;
+    operator bool() {
+      return A != 0 || B != 0;
+    }
   };
+
   ATTRIBUTE_NO_SANITIZE_ALL
   void Insert(size_t Idx, const T &Arg1, const T &Arg2) {
     Idx = Idx % kSize;
+    bool PrevInserted = Table[Idx];
     Table[Idx].A = Arg1;
     Table[Idx].B = Arg2;
+    bool NewInserted = Table[Idx];
+    NumEntries = NumEntries - PrevInserted + NewInserted;
   }
 
-  Pair Get(size_t I) { return Table[I % kSize]; }
+  ATTRIBUTE_NO_SANITIZE_ALL
+  void Clear(size_t Idx) {
+    Idx = Idx % kSize;
+    bool PrevInserted = Table[Idx];
+    Table[Idx].A = {};
+    Table[Idx].B = {};
+    NumEntries -= PrevInserted;
+  }
+
+  Pair Get(size_t I) {
+    for (size_t i = 0; i < kSize; i++) {
+      auto &Entry = Table[I % kSize];
+      if ((bool)Entry.A || (bool)Entry.B)
+        return Entry;
+    }
+    return Table[0];
+  }
 
   Pair Table[kSize];
 };
@@ -48,6 +74,7 @@ struct TableOfRecentCompares {
 template <size_t kSizeT>
 struct MemMemTable {
   static const size_t kSize = kSizeT;
+  size_t NumEntries = 0;
   Word MemMemWords[kSize];
   Word EmptyWord;
 
@@ -55,6 +82,9 @@ struct MemMemTable {
     if (Size <= 2) return;
     Size = std::min(Size, Word::GetMaxSize());
     auto Idx = SimpleFastHash(Data, Size) % kSize;
+    auto &Entry = MemMemWords[Idx];
+    if (Entry.size() == 0)
+      ++NumEntries;
     MemMemWords[Idx].Set(Data, Size);
   }
   const Word &Get(size_t Idx) {
@@ -69,10 +99,20 @@ struct MemMemTable {
 
 class TracePC {
  public:
+  MemoryTracer MemoryTrace;
   void HandleInline8bitCountersInit(uint8_t *Start, uint8_t *Stop);
   void HandlePCsInit(const uintptr_t *Start, const uintptr_t *Stop);
   void HandleCallerCallee(uintptr_t Caller, uintptr_t Callee);
-  template <class T> void HandleCmp(uintptr_t PC, T Arg1, T Arg2);
+  template <bool IsConst = false, typename T>
+  void HandleCmp(void *PC, T XVal, T YVal, const uint8_t *XPtr = nullptr,
+                 const uint8_t *YPtr = nullptr);
+
+  template <bool ZeroTerminate = false, MemoryTracer::TransformFnTy Transform = nullptr>
+  void HandleBufferCmp(void *PC, const void *X, const void *Y, size_t N,
+                       bool Solved);
+  template <bool ZeroTerminate = false>
+  void AddValueForMemcmp(size_t Hash, const void *XPtr, const void *YPtr, size_t MaxLen);
+
   size_t GetTotalPCCoverage();
   void SetUseCounters(bool UC) { UseCounters = UC; }
   void SetUseValueProfileMask(uint32_t VPMask) { UseValueProfileMask = VPMask; }
@@ -102,10 +142,10 @@ class TracePC {
   void AddValueForMemcmp(void *caller_pc, const void *s1, const void *s2,
                          size_t n, bool StopAtZero);
 
-  TableOfRecentCompares<uint32_t, 32> TORC4;
-  TableOfRecentCompares<uint64_t, 32> TORC8;
-  TableOfRecentCompares<Word, 32> TORCW;
-  MemMemTable<1024> MMT;
+  MemMemTable<128> MMT;
+  TableOfRecentCompares<uint32_t, 128> TORC4;
+  TableOfRecentCompares<uint64_t, 128> TORC8;
+  TableOfRecentCompares<Word, 128> TORCW;
 
   void RecordInitialStack();
   uintptr_t GetMaxStackOffset() const;

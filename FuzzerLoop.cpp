@@ -20,6 +20,9 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <sys/stat.h>
+#include <sys/fcntl.h>
+#include <unistd.h>
 
 #if defined(__has_include)
 #if __has_include(<sanitizer / lsan_interface.h>)
@@ -143,6 +146,7 @@ Fuzzer::Fuzzer(UserCallback CB, InputCorpus &Corpus, MutationDispatcher &MD,
   assert(!F);
   F = this;
   TPC.ResetMaps();
+  TPC.MemoryTrace.initialize();
   IsMyThread = true;
   if (Options.DetectLeaks && EF->__sanitizer_install_malloc_and_free_hooks)
     EF->__sanitizer_install_malloc_and_free_hooks(MallocHook, FreeHook);
@@ -173,9 +177,35 @@ void Fuzzer::StaticDeathCallback() {
   F->DeathCallback();
 }
 
-void Fuzzer::DumpCurrentUnit(const char *Prefix) {
+static char tohex(uint8_t Val) {
+  Val = Val & 0xf;
+  if (Val < 10) return '0' + Val;
+  return 'a' + Val - 10;
+}
+
+void Fuzzer::DumpCurrentUnit(const char *Prefix, bool IsEmergency) {
   if (!CurrentUnitData)
     return; // Happens when running individual inputs.
+
+  if (IsEmergency) {
+    constexpr int N = 200;
+    char Buf[N];
+    strncpy(Buf, Prefix, N);
+    Buf[N - 1] = 0;
+    auto Len = strlen(Buf);
+
+    uint8_t Hash[kSHA1NumBytes];
+    ComputeSHA1(CurrentUnitData, CurrentUnitSize, Hash);
+    for (int I = 0; I < kSHA1NumBytes && Len + 1 < N - 1; ++I, Len += 2) {
+      Buf[Len] = tohex(Hash[I] >> 4);
+      Buf[Len + 1] = tohex(Hash[I]);
+    }
+
+    int fd = open(Buf, O_CREAT | O_WRONLY, 0664);
+    write(fd, CurrentUnitData, CurrentUnitSize);
+    return;
+  }
+
   ScopedDisableMsanInterceptorChecks S;
   MD.PrintMutationSequence();
   Printf("; base unit: %s\n", Sha1ToString(BaseSha1).c_str());
@@ -190,8 +220,8 @@ void Fuzzer::DumpCurrentUnit(const char *Prefix) {
 
 NO_SANITIZE_MEMORY
 void Fuzzer::DeathCallback() {
-  DumpCurrentUnit("crash-");
-  PrintFinalStats();
+  DumpCurrentUnit("crash-", true);
+  _Exit(Options.ErrorExitCode);  // Stop right now.
 }
 
 void Fuzzer::StaticAlarmCallback() {
@@ -226,18 +256,8 @@ void Fuzzer::StaticFileSizeExceedCallback() {
 }
 
 void Fuzzer::CrashCallback() {
-  if (EF->__sanitizer_acquire_crash_state &&
-      !EF->__sanitizer_acquire_crash_state())
-    return;
-  Printf("==%lu== ERROR: libFuzzer: deadly signal\n", GetPid());
-  PrintStackTrace();
-  Printf("NOTE: libFuzzer has rudimentary signal handlers.\n"
-         "      Combine libFuzzer with AddressSanitizer or similar for better "
-         "crash reports.\n");
-  Printf("SUMMARY: libFuzzer: deadly signal\n");
-  DumpCurrentUnit("crash-");
-  PrintFinalStats();
-  _Exit(Options.ErrorExitCode); // Stop right now.
+  DumpCurrentUnit("crash-", true);
+  _Exit(Options.ErrorExitCode);  // Stop right now.
 }
 
 void Fuzzer::ExitCallback() {
@@ -527,22 +547,57 @@ bool Fuzzer::RunOne(const uint8_t *Data, size_t Size, bool MayDeleteFile,
                              II->UniqFeatureSet.end(), Feature))
         FoundUniqFeaturesOfII++;
   });
+
+  auto &MT = TPC.MemoryTrace;
+  auto HasMemoryDiscovery = !MT.CurrentDiscovery.empty();
   if (FoundUniqFeatures)
-    *FoundUniqFeatures = FoundUniqFeaturesOfII;
+    *FoundUniqFeatures = FoundUniqFeaturesOfII || HasMemoryDiscovery;
   PrintPulseAndReportSlowInput(Data, Size);
   size_t NumNewFeatures = Corpus.NumFeatureUpdates() - NumUpdatesBefore;
-  if (NumNewFeatures || ForceAddToCorpus) {
+
+  // Update hash if necessary.
+  size_t FeatureHash = 0;
+  if (HasMemoryDiscovery || NumNewFeatures || ForceAddToCorpus) {
+    TPC.CollectFeatures(
+        [&](uint32_t Feature) { FeatureHash = (FeatureHash << 1) ^ Feature; });
+  }
+
+  InputInfo *NewII = nullptr;
+  auto AddToCorpus = [&]() {
+    if (NewII) return NewII;
     TPC.UpdateObservedPCs();
-    auto NewII =
-        Corpus.AddToCorpus({Data, Data + Size}, NumNewFeatures, MayDeleteFile,
-                           TPC.ObservedFocusFunction(), ForceAddToCorpus,
-                           TimeOfUnit, UniqFeatureSetTmp, DFT, II);
+    NewII = Corpus.AddToCorpus({Data, Data + Size}, NumNewFeatures, FeatureHash,
+                               MayDeleteFile, TPC.ObservedFocusFunction(),
+                               ForceAddToCorpus, TimeOfUnit, UniqFeatureSetTmp,
+                               DFT, II);
     WriteFeatureSetToFile(Options.FeaturesDir, Sha1ToString(NewII->Sha1),
                           NewII->UniqFeatureSet);
     WriteEdgeToMutationGraphFile(Options.MutationGraphFile, NewII, II,
                                  MD.MutationSequence());
-    return true;
+    return NewII;
+  };
+
+  if (HasMemoryDiscovery) {
+    for (auto I : MT.CurrentDiscovery) {
+      if (auto *ExistingII = MT.CorpusMap[I]) {
+        if (ExistingII->FeatureHash == FeatureHash) {
+          // TODO maybe the existing input has multiple references inside the slot.
+          Corpus.Replace(ExistingII, {Data, Data + Size}, TimeOfUnit);
+        } else {
+          MT.CorpusMap[I] = AddToCorpus();
+        }
+      } else {
+        MT.CorpusMap[I] = AddToCorpus();
+      }
+    }
   }
+
+  if (NumNewFeatures || ForceAddToCorpus)
+    AddToCorpus();
+  if (NewII)
+    return true;
+
+  // Try replace the parent corpus.
   if (II && FoundUniqFeaturesOfII &&
       II->DataFlowTraceForFocusFunction.empty() &&
       FoundUniqFeaturesOfII == II->UniqFeatureSet.size() &&
@@ -607,9 +662,12 @@ ATTRIBUTE_NOINLINE void Fuzzer::ExecuteCallback(const uint8_t *Data,
     AllocTracer.Start(Options.TraceMalloc);
     UnitStartTime = system_clock::now();
     TPC.ResetMaps();
+    TPC.MemoryTrace.CurrentDiscovery.clear();
+    TPC.MemoryTrace.setInputRegion(DataCopy, Size);
     RunningUserCallback = true;
     int Res = CB(DataCopy, Size);
     RunningUserCallback = false;
+    TPC.MemoryTrace.setInputRegion(nullptr, 0);
     UnitStopTime = system_clock::now();
     (void)Res;
     assert(Res == 0);

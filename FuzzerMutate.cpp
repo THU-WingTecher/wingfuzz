@@ -257,33 +257,36 @@ DictionaryEntry MutationDispatcher::MakeDictionaryEntryFromCMP(
                                     Arg2.data(), Arg1.size(), Data, Size);
 }
 
-size_t MutationDispatcher::Mutate_AddWordFromTORC(
-    uint8_t *Data, size_t Size, size_t MaxSize) {
-  Word W;
+DictionaryEntry MutationDispatcher::Mutate_GenDictionaryEntry(uint8_t *Data,
+                                                              size_t Size,
+                                                              size_t MaxSize) {
   DictionaryEntry DE;
-  switch (Rand(4)) {
-  case 0: {
+  auto Case = Rand(4);
+  if (Case == 0) {
     auto X = TPC.TORC8.Get(Rand.Rand<size_t>());
-    DE = MakeDictionaryEntryFromCMP(X.A, X.B, Data, Size);
-  } break;
-  case 1: {
+    return MakeDictionaryEntryFromCMP(X.A, X.B, Data, Size);
+  }
+
+  if (Case == 1) {
     auto X = TPC.TORC4.Get(Rand.Rand<size_t>());
     if ((X.A >> 16) == 0 && (X.B >> 16) == 0 && Rand.RandBool())
-      DE = MakeDictionaryEntryFromCMP((uint16_t)X.A, (uint16_t)X.B, Data, Size);
+      return MakeDictionaryEntryFromCMP((uint16_t)X.A, (uint16_t)X.B, Data, Size);
     else
-      DE = MakeDictionaryEntryFromCMP(X.A, X.B, Data, Size);
-  } break;
-  case 2: {
-    auto X = TPC.TORCW.Get(Rand.Rand<size_t>());
-    DE = MakeDictionaryEntryFromCMP(X.A, X.B, Data, Size);
-  } break;
-  case 3: if (Options.UseMemmem) {
-      auto X = TPC.MMT.Get(Rand.Rand<size_t>());
-      DE = DictionaryEntry(X);
-  } break;
-  default:
-    assert(0);
+      return MakeDictionaryEntryFromCMP(X.A, X.B, Data, Size);
   }
+
+  if (Case == 2) {
+    auto X = TPC.TORCW.Get(Rand.Rand<size_t>());
+    return MakeDictionaryEntryFromCMP(X.A, X.B, Data, Size);
+  }
+
+  auto X = TPC.MMT.Get(Rand.Rand<size_t>());
+  return DictionaryEntry(X);
+}
+
+size_t MutationDispatcher::Mutate_AddWordFromTORC(uint8_t *Data, size_t Size,
+                                                  size_t MaxSize) {
+  auto DE = Mutate_GenDictionaryEntry(Data, Size, MaxSize);
   if (!DE.GetW().size()) return 0;
   Size = ApplyDictionaryEntry(Data, Size, MaxSize, DE);
   if (!Size) return 0;

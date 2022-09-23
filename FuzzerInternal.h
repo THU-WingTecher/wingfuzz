@@ -107,7 +107,7 @@ private:
   void CheckExitOnSrcPosOrItem();
 
   static void StaticDeathCallback();
-  void DumpCurrentUnit(const char *Prefix);
+  void DumpCurrentUnit(const char *Prefix, bool IsEmergency=false);
   void DeathCallback();
 
   void AllocateCurrentUnitData();

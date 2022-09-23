@@ -23,9 +23,9 @@ template <size_t kMaxSizeT> class FixedWord {
 public:
   static const size_t kMaxSize = kMaxSizeT;
   FixedWord() {}
-  FixedWord(const uint8_t *B, size_t S) { Set(B, S); }
+  FixedWord(const void *B, size_t S) { Set(B, std::min(S, kMaxSize)); }
 
-  void Set(const uint8_t *B, size_t S) {
+  void Set(const void *B, size_t S) {
     static_assert(kMaxSizeT <= std::numeric_limits<uint8_t>::max(),
                   "FixedWord::kMaxSizeT cannot fit in a uint8_t.");
     assert(S <= kMaxSize);
@@ -40,6 +40,7 @@ public:
   static size_t GetMaxSize() { return kMaxSize; }
   const uint8_t *data() const { return Data; }
   uint8_t size() const { return Size; }
+  operator bool() const { return Size; }
 
 private:
   uint8_t Size = 0;
@@ -51,7 +52,7 @@ typedef FixedWord<64> Word;
 class DictionaryEntry {
  public:
   DictionaryEntry() {}
-  DictionaryEntry(Word W) : W(W) {}
+  explicit DictionaryEntry(Word W) : W(W) {}
   DictionaryEntry(Word W, size_t PositionHint)
       : W(W), PositionHint(PositionHint) {}
   const Word &GetW() const { return W; }

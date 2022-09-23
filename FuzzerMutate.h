@@ -54,6 +54,9 @@ public:
   size_t Mutate_AddWordFromManualDictionary(uint8_t *Data, size_t Size,
                                             size_t MaxSize);
 
+  DictionaryEntry Mutate_GenDictionaryEntry(uint8_t *Data, size_t Size,
+                                            size_t MaxSize);
+
   /// Mutates data by adding a word from the TORC.
   size_t Mutate_AddWordFromTORC(uint8_t *Data, size_t Size, size_t MaxSize);
 

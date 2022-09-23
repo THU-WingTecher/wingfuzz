@@ -30,7 +30,7 @@ struct InputInfo {
   std::chrono::microseconds TimeOfUnit;
   uint8_t Sha1[kSHA1NumBytes];  // Checksum.
   // Number of features that this input has and no smaller input has.
-  size_t NumFeatures = 0;
+  size_t NumFeatures = 0, FeatureHash = 0;
   size_t Tmp = 0; // Used by ValidateFeatureSet.
   // Stats.
   size_t NumExecutedMutations = 0;
@@ -206,20 +206,21 @@ public:
 
   bool empty() const { return Inputs.empty(); }
   const Unit &operator[] (size_t Idx) const { return Inputs[Idx]->U; }
-  InputInfo *AddToCorpus(const Unit &U, size_t NumFeatures, bool MayDeleteFile,
-                         bool HasFocusFunction, bool NeverReduce,
-                         std::chrono::microseconds TimeOfUnit,
+  InputInfo *AddToCorpus(const Unit &U, size_t NumFeatures, size_t FeatureHash,
+                         bool MayDeleteFile, bool HasFocusFunction,
+                         bool NeverReduce, std::chrono::microseconds TimeOfUnit,
                          const std::vector<uint32_t> &FeatureSet,
                          const DataFlowTrace &DFT, const InputInfo *BaseII) {
     assert(!U.empty());
     if (FeatureDebug)
-      Printf("ADD_TO_CORPUS %zd NF %zd\n", Inputs.size(), NumFeatures);
+      Printf("ADD_TO_CORPUS %zd NF %zd FH %x\n", Inputs.size(), NumFeatures, FeatureHash);
     // Inputs.size() is cast to uint32_t below.
     assert(Inputs.size() < std::numeric_limits<uint32_t>::max());
     Inputs.push_back(new InputInfo());
     InputInfo &II = *Inputs.back();
     II.U = U;
     II.NumFeatures = NumFeatures;
+    II.FeatureHash = FeatureHash;
     II.NeverReduce = NeverReduce;
     II.TimeOfUnit = TimeOfUnit;
     II.MayDeleteFile = MayDeleteFile;
@@ -286,7 +287,6 @@ public:
 
   void Replace(InputInfo *II, const Unit &U,
                std::chrono::microseconds TimeOfUnit) {
-    assert(II->U.size() > U.size());
     Hashes.erase(Sha1ToString(II->Sha1));
     DeleteFile(*II);
     ComputeSHA1(U.data(), U.size(), II->Sha1);
