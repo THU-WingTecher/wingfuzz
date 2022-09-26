@@ -7,7 +7,6 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
-#define ENABLE_DEBUG
 
 using namespace llvm;
 
