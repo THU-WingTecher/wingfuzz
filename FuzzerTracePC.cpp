@@ -29,12 +29,6 @@
 ATTRIBUTES_INTERFACE_TLS_INITIAL_EXEC uintptr_t __sancov_lowest_stack;
 
 namespace {
-template <typename T>
-size_t countEqualBits(T X, T Y) {
-  auto DiffBits = __builtin_popcountl(X ^ Y);
-  return sizeof(T) * 8 - DiffBits;
-}
-
 uint8_t tolower_u(uint8_t C) {
   return std::tolower(C);
 }
@@ -355,18 +349,31 @@ void TracePC::PrintCoverage(bool PrintAllCounters) {
   IterateCoveredFunctions(CoveredFunctionCallback);
 }
 
-template <bool IsConst, typename T>
-void TracePC::HandleCmp(void *PC, T XVal, T YVal, const uint8_t *XPtr,
-                        const uint8_t *YPtr) {
-  size_t Hash = IsConst ? reinterpret_cast<size_t>(PC)
-                        : MemoryTrace.hashBufferCompare(PC, XPtr, YPtr);
+template <typename T>
+void TracePC::HandleSwitch(uintptr_t PC, T Val, T N, const T* Vals) {
+  auto Cmp = [&](int J) {
+    if (J >= 0 && (int)J < N)
+      HandleCmp(PC + J, Val, Vals[J]);
+  };
 
+  if (Val < Vals[0] || Val > Vals[N - 1]) {
+    Cmp(0), Cmp(N - 1);
+    return;
+  }
+
+  int I = std::lower_bound(Vals, Vals + N, Val) - Vals;
+  Cmp(I), Cmp(I + 1);
+  if (Vals[I] == Val) Cmp(I - 1);
+}
+
+template <typename T, unsigned (*EqFn)(T X, T Y)>
+void TracePC::HandleCmp(size_t Hash, T XVal, T YVal) {
   auto *PSlot = MemoryTrace.locatePriority(Hash);
   if (!PSlot)  // Skip if already succeeded.
     return;
 
   auto Solved = XVal == YVal;
-  auto PVal = Solved ? MemoryTracer::MAX_PRIORITY : countEqualBits(XVal, YVal);
+  auto PVal = Solved ? MemoryTracer::MAX_PRIORITY : EqFn(XVal, YVal);
   MemoryTrace.addFeature(Hash, *PSlot, PVal);
 
   if (PVal == MemoryTracer::MAX_PRIORITY) {
@@ -379,7 +386,7 @@ void TracePC::HandleCmp(void *PC, T XVal, T YVal, const uint8_t *XPtr,
   }
 
   if (!MemoryTracer::hasRichInfo(XVal)) return;
-  if (!IsConst && !MemoryTracer::hasRichInfo(YVal)) return;
+  if (!MemoryTracer::hasRichInfo(YVal)) return;
 
   if (sizeof(T) == 4)
     TORC4.Insert(Hash, XVal, YVal);
@@ -491,20 +498,38 @@ void __sanitizer_cov_pcs_init(const uintptr_t *pcs_beg,
 ATTRIBUTE_INTERFACE
 ATTRIBUTE_NO_SANITIZE_ALL
 void __sanitizer_cov_trace_pc_indir(uintptr_t Callee) {
-  uintptr_t PC = reinterpret_cast<uintptr_t>(GET_CALLER_PC());
-  fuzzer::TPC.HandleCallerCallee(PC, Callee);
+  fuzzer::TPC.HandleCallerCallee(GET_CALLER_PC_INT(), Callee);
 }
 
-#define GEN_CMP_FN(BYTES, TYPE, ...)                                           \
-  ATTRIBUTE_INTERFACE ATTRIBUTE_NO_SANITIZE_ALL void                           \
-      __sanitizer_cov_tracecmp_var##BYTES(                                     \
-          TYPE LHS, TYPE RHS, const uint8_t *LPtr, const uint8_t *RPtr) {      \
-    fuzzer::TPC.HandleCmp<false>(GET_CALLER_PC(), LHS, RHS, LPtr, RPtr);       \
-  }                                                                            \
-  ATTRIBUTE_INTERFACE ATTRIBUTE_NO_SANITIZE_ALL void                           \
-      __sanitizer_cov_tracecmp_const##BYTES(TYPE Var, TYPE Const,              \
-                                            const uint8_t *VarPtr) {           \
-    fuzzer::TPC.HandleCmp<true>(GET_CALLER_PC(), Var, Const, VarPtr, nullptr); \
+#define GEN_CMP_FN(BYTES, TYPE, ...)                                       \
+  ATTRIBUTE_INTERFACE ATTRIBUTE_NO_SANITIZE_ALL void                       \
+      __sanitizer_cov_trace_load##BYTES(TYPE *Ptr) {                       \
+    fuzzer::TPC.MemoryTrace.traceLoad(Ptr, BYTES);                         \
+  }                                                                        \
+  ATTRIBUTE_INTERFACE ATTRIBUTE_NO_SANITIZE_ALL void                       \
+      __sanitizer_cov_tracecmp_var##BYTES(                                 \
+          TYPE LHS, TYPE RHS, const uint8_t *LPtr, const uint8_t *RPtr) {  \
+    auto Hash = fuzzer::TPC.MemoryTrace.hashBufferCompare(GET_CALLER_PC(), \
+                                                          LPtr, RPtr);     \
+    fuzzer::TPC.HandleCmp(Hash, LHS, RHS);                                 \
+  }                                                                        \
+  ATTRIBUTE_INTERFACE ATTRIBUTE_NO_SANITIZE_ALL void                       \
+      __sanitizer_cov_tracecmp_ord##BYTES(                                 \
+          TYPE LHS, TYPE RHS, const uint8_t *LPtr, const uint8_t *RPtr) {  \
+    auto Hash = fuzzer::TPC.MemoryTrace.hashBufferCompare(GET_CALLER_PC(), \
+                                                          LPtr, RPtr);     \
+    fuzzer::TPC                                                            \
+        .HandleCmp<TYPE, fuzzer::MemoryTracer::countLeadingZeroes<TYPE>>(  \
+            Hash, LHS, RHS);                                               \
+  }                                                                        \
+  ATTRIBUTE_INTERFACE ATTRIBUTE_NO_SANITIZE_ALL void                       \
+      __sanitizer_cov_tracecmp_const##BYTES(TYPE Var, TYPE Const) {        \
+    fuzzer::TPC.HandleCmp(GET_CALLER_PC_INT(), Var, Const);                \
+  }                                                                        \
+  ATTRIBUTE_INTERFACE ATTRIBUTE_NO_SANITIZE_ALL void                       \
+      __sanitizer_cov_trace_switch##BYTES(TYPE Val, TYPE Num,              \
+                                          const TYPE *Cases) {             \
+    fuzzer::TPC.HandleSwitch(GET_CALLER_PC_INT(), Val, Num, Cases);        \
   }
 
 #define GEN_CMP_ALL(GENFN, ...)   \
@@ -521,67 +546,22 @@ GEN_CMP_ALL(GEN_CMP_FN)
 ATTRIBUTE_INTERFACE
 ATTRIBUTE_NO_SANITIZE_ALL
 ATTRIBUTE_TARGET_POPCNT
-void __sanitizer_cov_trace_switch(uint64_t Val, uint64_t *Cases) {
-  uint64_t N = Cases[0];
-  uint64_t ValSizeInBits = Cases[1];
-  uint64_t *Vals = Cases + 2;
-  // Skip the most common and the most boring case: all switch values are small.
-  // We may want to skip this at compile-time, but it will make the
-  // instrumentation less general.
-  if (Vals[N - 1] < 256) return;
-  // Also skip small inputs values, they won't give good signal.
-  if (Val < 256) return;
-  auto PC = reinterpret_cast<uint8_t *>(GET_CALLER_PC());
-  size_t i;
-  uint64_t Smaller = 0;
-  uint64_t Larger = ~(uint64_t)0;
-  // Find two switch values such that Smaller < Val < Larger.
-  // Use 0 and 0xfff..f as the defaults.
-  for (i = 0; i < N; i++) {
-    if (Val < Vals[i]) {
-      Larger = Vals[i];
-      break;
-    }
-    if (Val > Vals[i]) Smaller = Vals[i];
-  }
-
-  // Apply HandleCmp to {Val,Smaller} and {Val, Larger},
-  // use i as the PC modifier for HandleCmp.
-  if (ValSizeInBits == 16) {
-    fuzzer::TPC.HandleCmp<true>(PC + 2 * i, static_cast<uint16_t>(Val),
-                                (uint16_t)(Smaller));
-    fuzzer::TPC.HandleCmp<true>(PC + 2 * i + 1, static_cast<uint16_t>(Val),
-                                (uint16_t)(Larger));
-  } else if (ValSizeInBits == 32) {
-    fuzzer::TPC.HandleCmp<true>(PC + 2 * i, static_cast<uint32_t>(Val),
-                                (uint32_t)(Smaller));
-    fuzzer::TPC.HandleCmp<true>(PC + 2 * i + 1, static_cast<uint32_t>(Val),
-                                (uint32_t)(Larger));
-  } else {
-    fuzzer::TPC.HandleCmp<true>(PC + 2 * i, Val, Smaller);
-    fuzzer::TPC.HandleCmp<true>(PC + 2 * i + 1, Val, Larger);
-  }
-}
-
-ATTRIBUTE_INTERFACE
-ATTRIBUTE_NO_SANITIZE_ALL
-ATTRIBUTE_TARGET_POPCNT
 void __sanitizer_cov_trace_div4(uint32_t Val) {
-  fuzzer::TPC.HandleCmp<true>(GET_CALLER_PC(), Val, (uint32_t)0);
+  fuzzer::TPC.HandleCmp(GET_CALLER_PC_INT(), Val, (uint32_t)0);
 }
 
 ATTRIBUTE_INTERFACE
 ATTRIBUTE_NO_SANITIZE_ALL
 ATTRIBUTE_TARGET_POPCNT
 void __sanitizer_cov_trace_div8(uint64_t Val) {
-  fuzzer::TPC.HandleCmp<true>(GET_CALLER_PC(), Val, (uint64_t)0);
+  fuzzer::TPC.HandleCmp(GET_CALLER_PC_INT(), Val, (uint64_t)0);
 }
 
 ATTRIBUTE_INTERFACE
 ATTRIBUTE_NO_SANITIZE_ALL
 ATTRIBUTE_TARGET_POPCNT
 void __sanitizer_cov_trace_gep(uintptr_t Idx) {
-  fuzzer::TPC.HandleCmp<true>(GET_CALLER_PC(), Idx, (uintptr_t)0);
+  fuzzer::TPC.HandleCmp(GET_CALLER_PC_INT(), Idx, (uintptr_t)0);
 }
 
 ATTRIBUTE_INTERFACE ATTRIBUTE_NO_SANITIZE_MEMORY

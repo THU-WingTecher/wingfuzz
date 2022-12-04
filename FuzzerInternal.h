@@ -69,6 +69,9 @@ public:
   bool RunOne(const uint8_t *Data, size_t Size, bool MayDeleteFile = false,
               InputInfo *II = nullptr, bool ForceAddToCorpus = false,
               bool *FoundUniqFeatures = nullptr);
+  // Returns the number of new features.
+  size_t DetectCodeFeatures(size_t Size, InputInfo *II, bool &MayReduceParent,
+                            bool *FoundUniqueFeatures);
   void TPCUpdateObservedPCs();
 
   // Merge Corpora[1:] into Corpora[0].

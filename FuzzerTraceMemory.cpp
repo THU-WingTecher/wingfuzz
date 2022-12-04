@@ -2,6 +2,7 @@
 
 #include <link.h>
 
+#include <algorithm>
 #include "FuzzerIO.h"
 
 namespace fuzzer {
@@ -22,8 +23,7 @@ int MemoryTracer::iterateProgramHeader(dl_phdr_info *Info, size_t Size,
     auto Size = std::min(I->p_memsz, I->p_filesz);
     auto *End = Begin + Size;
 
-    if (I->p_flags == PF_R)
-      MT.Data.extend(Begin, End);
+    if (I->p_flags == PF_R) MT.Data.extend(Begin, End);
     MT.Load.extend(Begin, End);
   }
 
@@ -34,6 +34,12 @@ void MemoryTracer::initialize() {
   dl_iterate_phdr(iterateProgramHeader, this);
   Printf("LAYOUT: Load %p-%p; Data %p-%p\n", Load.Begin, Load.End, Data.Begin,
          Data.End);
+}
+
+void MemoryTracer::sortDiscovery() {
+  auto &CD = CurrentDiscovery;
+  std::sort(CD.begin(), CD.end());
+  CD.erase(std::unique(CD.begin(), CD.end()), CD.end());
 }
 
 }  // namespace fuzzer

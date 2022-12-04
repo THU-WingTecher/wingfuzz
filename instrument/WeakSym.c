@@ -3,11 +3,23 @@
 
 #define GEN_CMP_FN(BYTES, TYPE, ...)                \
   ATTRIBUTE_INTERFACE SANITIZER_WEAK_ATTRIBUTE void \
+      __sanitizer_cov_trace_load##BYTES() {         \
+    return;                                         \
+  }                                                 \
+  ATTRIBUTE_INTERFACE SANITIZER_WEAK_ATTRIBUTE void \
       __sanitizer_cov_tracecmp_var##BYTES() {       \
     return;                                         \
   }                                                 \
   ATTRIBUTE_INTERFACE SANITIZER_WEAK_ATTRIBUTE void \
-      __sanitizer_cov_tracecmp_const##BYTES() {       \
+      __sanitizer_cov_tracecmp_ord##BYTES() {       \
+    return;                                         \
+  }                                                 \
+  ATTRIBUTE_INTERFACE SANITIZER_WEAK_ATTRIBUTE void \
+      __sanitizer_cov_tracecmp_const##BYTES() {     \
+    return;                                         \
+  }                                                 \
+  ATTRIBUTE_INTERFACE SANITIZER_WEAK_ATTRIBUTE void \
+      __sanitizer_cov_trace_switch##BYTES() {       \
     return;                                         \
   }
 

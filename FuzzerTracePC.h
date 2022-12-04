@@ -103,9 +103,10 @@ class TracePC {
   void HandleInline8bitCountersInit(uint8_t *Start, uint8_t *Stop);
   void HandlePCsInit(const uintptr_t *Start, const uintptr_t *Stop);
   void HandleCallerCallee(uintptr_t Caller, uintptr_t Callee);
-  template <bool IsConst = false, typename T>
-  void HandleCmp(void *PC, T XVal, T YVal, const uint8_t *XPtr = nullptr,
-                 const uint8_t *YPtr = nullptr);
+  template <typename T, unsigned (*EqFn)(T X, T Y) = fuzzer::MemoryTracer::countEqualBits>
+  void HandleCmp(size_t Hash, T XVal, T YVal);
+  template <typename T>
+  void HandleSwitch(uintptr_t PC, T Val, T Num, const T *Cases);
 
   template <bool ZeroTerminate = false, MemoryTracer::TransformFnTy Transform = nullptr>
   void HandleBufferCmp(void *PC, const void *X, const void *Y, size_t N,

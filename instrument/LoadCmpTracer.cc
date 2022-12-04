@@ -35,6 +35,14 @@ bool IsInterestingCmp(ICmpInst *CMP, const DominatorTree *DT,
   return true;
 }
 
+bool IsInterestingLoad(LoadInst *Load, const DataLayout &DL) {
+  if (!Load->isSimple()) return false;
+
+  auto Ptr = Load->getPointerOperand()->stripInBoundsConstantOffsets();
+  if (isa<AllocaInst>(Load->getPointerOperand())) return false;
+  return true;
+}
+
 bool shouldInstrument(const Function &F) {
   if (F.empty()) return false;
   if (F.getName().find(".module_ctor") != std::string::npos)
@@ -54,12 +62,17 @@ bool shouldInstrument(const Function &F) {
 
 struct LoadCmpTracerPass : public PassInfoMixin<LoadCmpTracerPass> {
   FunctionCallee TraceVarFn[4];
+  FunctionCallee TraceOrdFn[4];
   FunctionCallee TraceConstFn[4];
-  FunctionCallee TraceSwitchFn;
+  FunctionCallee TraceSwitchFn[4];
+  FunctionCallee TraceLoadFn[4];
+
+  DenseSet<Value *> InstrumentedPtrs;
 
   void survey(Module &M, ModuleAnalysisManager &MAM,
               SmallVectorImpl<ICmpInst *> &Cmps,
-              SmallVectorImpl<SwitchInst *> &Switches) {
+              SmallVectorImpl<SwitchInst *> &Switches,
+              SmallVectorImpl<LoadInst *> &Loads) {
     auto &FAM =
         MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
     auto &DL = M.getDataLayout();
@@ -73,6 +86,8 @@ struct LoadCmpTracerPass : public PassInfoMixin<LoadCmpTracerPass> {
           if (IsInterestingCmp(Cmp, &DT, DL)) Cmps.emplace_back(Cmp);
         if (auto *Switch = dyn_cast<SwitchInst>(&I))
           Switches.emplace_back(Switch);
+        if (auto *Load = dyn_cast<LoadInst>(&I))
+          if (IsInterestingLoad(Load, DL)) Loads.emplace_back(Load);
       }
     }
   }
@@ -82,7 +97,9 @@ struct LoadCmpTracerPass : public PassInfoMixin<LoadCmpTracerPass> {
     auto *Inst = dyn_cast<Instruction>(Val);
     if (!Inst) return nullptr;
 
-    if (auto *Load = dyn_cast<LoadInst>(Val)) return Load->getPointerOperand();
+    if (auto *Load = dyn_cast<LoadInst>(Val))
+      if (IsInterestingLoad(Load, Load->getModule()->getDataLayout()))
+        return Load->getPointerOperand();
     if (auto *Cast = dyn_cast<CastInst>(Val))
       return findPointer(Cast->getOperand(0));
     if (auto *Intrin = dyn_cast<IntrinsicInst>(Val)) {
@@ -99,15 +116,18 @@ struct LoadCmpTracerPass : public PassInfoMixin<LoadCmpTracerPass> {
     return nullptr;
   }
 
-  Value *findPointer(const ICmpInst *Cmp, Value *Val) const {
+  Value *findPointer(const Instruction *Inst, Value *Val) {
     auto *Ptr = findPointer(Val);
-    if (Ptr) return Ptr;
+    if (Ptr) {
+      InstrumentedPtrs.insert(Ptr);
+      return Ptr;
+    }
 
 #if defined(ENABLE_DEBUG)
-    auto *F = Cmp->getFunction();
+    auto *F = Inst->getFunction();
     errs() << "PtrMissing: " << F->getName() << ": " << *Val << "\n";
 #endif
-    auto &C = Cmp->getContext();
+    auto &C = Inst->getContext();
     return ConstantPointerNull::get(IntegerType::getInt8PtrTy(C));
   }
 
@@ -154,19 +174,12 @@ struct LoadCmpTracerPass : public PassInfoMixin<LoadCmpTracerPass> {
       return false;
     }
 
+    if (!Cmp->isEquality()) return instrumentVariable(Cmp, Var, Const);
+
     IRBuilder<> IRB(Cmp);
     auto *IntTy = IRB.getIntNTy(IntBits);
-    auto *VarPtr = findPointer(Cmp, Var);
-#if defined(ENABLE_DEBUG)
-    errs() << "  LConst-Instrument:\n";
-    errs() << "    LConst-Value: " << *Const << "\n";
-    errs() << "    LConst-Variable: " << *Var << "\n";
-    errs() << "    LConst-Ptr: " << *VarPtr << "\n";
-#endif
-    IRB.CreateCall(*RuntimeFn,
-                   {IRB.CreateIntCast(Var, IntTy, false),
-                    IRB.CreateIntCast(Const, IntTy, false),
-                    IRB.CreateBitOrPointerCast(VarPtr, IRB.getInt8PtrTy())});
+    IRB.CreateCall(*RuntimeFn, {IRB.CreateIntCast(Var, IntTy, false),
+                                IRB.CreateIntCast(Const, IntTy, false)});
     return true;
   }
 
@@ -177,13 +190,6 @@ struct LoadCmpTracerPass : public PassInfoMixin<LoadCmpTracerPass> {
 #endif
     auto &DL = Cmp->getModule()->getDataLayout();
     auto IntBits = DL.getTypeSizeInBits(LHS->getType());
-    auto *RuntimeFn = findFunction(IntBits, TraceVarFn);
-    if (!RuntimeFn) {
-#if defined(ENABLE_DEBUG)
-      errs() << "  LVar-NoFn\n";
-#endif
-      return false;
-    }
 
     auto *LPtr = findPointer(Cmp, LHS), *RPtr = findPointer(Cmp, RHS);
 #if defined(ENABLE_DEBUG)
@@ -194,11 +200,20 @@ struct LoadCmpTracerPass : public PassInfoMixin<LoadCmpTracerPass> {
     errs() << "    LVar-RPtr: " << *RPtr << "\n";
 #endif
 
+    auto FnFamily = Cmp->isEquality() ? TraceVarFn : TraceOrdFn;
+    auto *RuntimeFn = findFunction(IntBits, FnFamily);
+    if (!RuntimeFn) {
+#if defined(ENABLE_DEBUG)
+      errs() << "  LVar-NoFn\n";
+#endif
+      return false;
+    }
+
     IRBuilder<> IRB(Cmp);
     auto *IntTy = IRB.getIntNTy(IntBits);
     IRB.CreateCall(*RuntimeFn,
-                   {IRB.CreateIntCast(LHS, IntTy, Cmp->isSigned()),
-                    IRB.CreateIntCast(RHS, IntTy, Cmp->isSigned()),
+                   {IRB.CreateIntCast(LHS, IntTy, false),
+                    IRB.CreateIntCast(RHS, IntTy, false),
                     IRB.CreateBitOrPointerCast(LPtr, IRB.getInt8PtrTy()),
                     IRB.CreateBitOrPointerCast(RPtr, IRB.getInt8PtrTy())});
     return true;
@@ -206,38 +221,32 @@ struct LoadCmpTracerPass : public PassInfoMixin<LoadCmpTracerPass> {
 
   bool instrumentSwitch(Module &M, SwitchInst *SI) {
     IRBuilder<> IRB(SI);
-    static constexpr unsigned MaxBits = 64;
-    auto *IntTy = IRB.getIntNTy(MaxBits);
     auto *Cond = SI->getCondition();
-    auto CondBits = Cond->getType()->getScalarSizeInBits();
+    auto &DL = SI->getModule()->getDataLayout();
+    auto IntBits = DL.getTypeSizeInBits(Cond->getType());
+    auto *RuntimeFn = findFunction(IntBits, TraceSwitchFn);
+    if (!RuntimeFn) return false;
 
     SmallVector<Constant *, 16> Initializers;
-    if (CondBits > MaxBits) return false;
-
-    Initializers.push_back(IRB.getInt64(SI->getNumCases()));
-    Initializers.push_back(IRB.getInt64(CondBits));
-    for (auto It : SI->cases()) {
-      Constant *C = It.getCaseValue();
-      if (CondBits < MaxBits)
-        C = ConstantExpr::getCast(CastInst::ZExt, It.getCaseValue(), IntTy);
-      Initializers.push_back(C);
+    for (auto It : SI->cases()) Initializers.push_back(It.getCaseValue());
+    llvm::sort(Initializers, [](const Constant *A, const Constant *B) {
+      return cast<ConstantInt>(A)->getLimitedValue() <
+             cast<ConstantInt>(B)->getLimitedValue();
+    });
+    auto &Value = cast<ConstantInt>(Initializers.back())->getValue();
+    if (Value.getActiveBits() < 8 || (-Value).getActiveBits() < 8) {
+      return false;
     }
 
-    llvm::sort(drop_begin(Initializers, 2),
-               [](const Constant *A, const Constant *B) {
-                 return cast<ConstantInt>(A)->getLimitedValue() <
-                        cast<ConstantInt>(B)->getLimitedValue();
-               });
-
-    ArrayType *IntArrayTy = ArrayType::get(IntTy, Initializers.size());
+    ArrayType *IntArrayTy =
+        ArrayType::get(Cond->getType(), Initializers.size());
     GlobalVariable *GV = new GlobalVariable(
         M, IntArrayTy, false, GlobalVariable::InternalLinkage,
         ConstantArray::get(IntArrayTy, Initializers),
         "__sancov_gen_cov_switch_values");
-    if (CondBits < MaxBits) Cond = IRB.CreateIntCast(Cond, IntTy, false);
-
-    IRB.CreateCall(TraceSwitchFn, {Cond, IRB.CreateBitOrPointerCast(
-                                             GV, IntTy->getPointerTo())});
+    IRB.CreateCall(*RuntimeFn,
+                   {Cond, IRB.getIntN(IntBits, SI->getNumCases()),
+                    IRB.CreateBitOrPointerCast(GV, IRB.getInt8PtrTy())});
     return true;
   }
 
@@ -254,6 +263,23 @@ struct LoadCmpTracerPass : public PassInfoMixin<LoadCmpTracerPass> {
       return instrumentConst(Cmp, LHS, RConst);  // assert(RConst)
   }
 
+  bool instrumentLoad(LoadInst *Load) {
+    IRBuilder<> IRB(Load);
+
+    auto &DL = Load->getModule()->getDataLayout();
+    auto IntBits = DL.getTypeSizeInBits(Load->getType());
+    auto *RuntimeFn = findFunction(IntBits, TraceLoadFn);
+    if (!RuntimeFn) return false;
+
+    auto *Ptr = Load->getPointerOperand();
+    auto *Base = Ptr->stripPointerCastsAndAliases()->stripInBoundsOffsets();
+    if (!isa<Constant>(Base)) return false;
+
+    IRB.CreateCall(*RuntimeFn,
+                   {IRB.CreateBitOrPointerCast(Ptr, IRB.getInt8PtrTy())});
+    return true;
+  }
+
   void createRuntimeFunction(Module &M, unsigned FnIndex, unsigned NBytes) {
     std::string FName;
 
@@ -266,20 +292,32 @@ struct LoadCmpTracerPass : public PassInfoMixin<LoadCmpTracerPass> {
 
     // void tracecmp_var(LHS, RHS, LPtr, RPtr);
     FName = (Twine("__sanitizer_cov_tracecmp_var") + Twine(NBytes)).str();
-
     auto VarFn = M.getOrInsertFunction(FName, Attrs, IRB.getVoidTy(), Ty, Ty,
                                        PtrTy, PtrTy);
 
-    // void tracecmp_const(Var, Const, VarPtr);
+    // void tracecmp_var(LHS, RHS, LPtr, RPtr);
+    FName = (Twine("__sanitizer_cov_tracecmp_ord") + Twine(NBytes)).str();
+    auto OrdFn = M.getOrInsertFunction(FName, Attrs, IRB.getVoidTy(), Ty, Ty,
+                                       PtrTy, PtrTy);
+
+    // void tracecmp_const(Var, Const);
     FName = (Twine("__sanitizer_cov_tracecmp_const") + Twine(NBytes)).str();
-    auto ConstFn =
+    auto ConstFn = M.getOrInsertFunction(FName, Attrs, IRB.getVoidTy(), Ty, Ty);
+
+    // void trace_switch(Var, Num, Cases);
+    FName = (Twine("__sanitizer_cov_trace_switch") + Twine(NBytes)).str();
+    auto SwitchFn =
         M.getOrInsertFunction(FName, Attrs, IRB.getVoidTy(), Ty, Ty, PtrTy);
 
+    // void trace_load(Ptr);
+    FName = (Twine("__sanitizer_cov_trace_load") + Twine(NBytes)).str();
+    auto LoadFn = M.getOrInsertFunction(FName, Attrs, IRB.getVoidTy(), PtrTy);
+
     TraceVarFn[FnIndex] = VarFn;
+    TraceOrdFn[FnIndex] = OrdFn;
     TraceConstFn[FnIndex] = ConstFn;
-    TraceSwitchFn = M.getOrInsertFunction("__sanitizer_cov_trace_switch",
-                                          IRB.getVoidTy(), IRB.getInt64Ty(),
-                                          IRB.getInt64Ty()->getPointerTo());
+    TraceSwitchFn[FnIndex] = SwitchFn;
+    TraceLoadFn[FnIndex] = LoadFn;
   }
 
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
@@ -289,11 +327,17 @@ struct LoadCmpTracerPass : public PassInfoMixin<LoadCmpTracerPass> {
     createRuntimeFunction(M, 3, 8);
 
     SmallVector<ICmpInst *, 0> Cmps;
-    SmallVector<SwitchInst *, 16> Switches;
-    survey(M, MAM, Cmps, Switches);
+    SmallVector<SwitchInst *, 0> Switches;
+    SmallVector<LoadInst *, 0> Loads;
+    survey(M, MAM, Cmps, Switches, Loads);
+
     for (auto *Cmp : Cmps)
       instrument(Cmp, Cmp->getOperand(0), Cmp->getOperand(1));
     for (auto *Switch : Switches) instrumentSwitch(M, Switch);
+    for (auto Load : Loads)
+      if (!InstrumentedPtrs.contains(Load->getPointerOperand()))
+        instrumentLoad(Load);
+
     return PreservedAnalyses::none();
   }
 };

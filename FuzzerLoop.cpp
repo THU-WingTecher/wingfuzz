@@ -312,15 +312,7 @@ void Fuzzer::AlarmCallback() {
     if (EF->__sanitizer_acquire_crash_state &&
         !EF->__sanitizer_acquire_crash_state())
       return;
-    Printf("ALARM: working on the last Unit for %zd seconds\n", Seconds);
-    Printf("       and the timeout value is %d (use -timeout=N to change)\n",
-           Options.UnitTimeoutSec);
-    DumpCurrentUnit("timeout-");
-    Printf("==%lu== ERROR: libFuzzer: timeout after %d seconds\n", GetPid(),
-           Seconds);
-    PrintStackTrace();
-    Printf("SUMMARY: libFuzzer: timeout\n");
-    PrintFinalStats();
+    DumpCurrentUnit("timeout-", true);
     _Exit(Options.TimeoutExitCode); // Stop right now.
   }
 }
@@ -526,89 +518,94 @@ static void WriteEdgeToMutationGraphFile(const std::string &MutationGraphFile,
 bool Fuzzer::RunOne(const uint8_t *Data, size_t Size, bool MayDeleteFile,
                     InputInfo *II, bool ForceAddToCorpus,
                     bool *FoundUniqFeatures) {
-  if (!Size)
-    return false;
+  if (!Size) return false;
   // Largest input length should be INT_MAX.
   assert(Size < std::numeric_limits<uint32_t>::max());
-
   ExecuteCallback(Data, Size);
   auto TimeOfUnit = duration_cast<microseconds>(UnitStopTime - UnitStartTime);
 
+  // Handle code features.
+  bool MayReduceParent;
+  auto NumNewCodeFeatures = DetectCodeFeatures(Size, II, MayReduceParent, FoundUniqFeatures);
+  auto HasNewDataFeatures = !TPC.MemoryTrace.CurrentDiscovery.empty();
+  PrintPulseAndReportSlowInput(Data, Size);
+
+  // Utility.
+  auto ReplaceCorpus = [&](InputInfo *II) {
+    auto OldFeaturesFile = Sha1ToString(II->Sha1);
+    Corpus.Replace(II, {Data, Data + Size}, TimeOfUnit);
+    RenameFeatureSetFile(Options.FeaturesDir, OldFeaturesFile,
+                         Sha1ToString(II->Sha1));
+  };
+  auto MarkDataFeatures = [](InputInfo *II,
+                             const std::vector<uint32_t> &NewDataFeatures) {
+    auto &MT = TPC.MemoryTrace;
+    for (auto I : NewDataFeatures) MT.CorpusMap[I] = II;
+  };
+
+  // Handle the boring, common case.
+  auto HasNewFeatures = NumNewCodeFeatures || HasNewDataFeatures;
+  if (!HasNewFeatures && !ForceAddToCorpus) [[likely]] {
+    if (!MayReduceParent) return false;
+    ReplaceCorpus(II);
+    return true;
+  }
+
+  size_t CodeFeatureHash = 0;
+  TPC.CollectFeatures(
+      [&](uint32_t Feature) { CodeFeatureHash = (CodeFeatureHash << 1) ^ Feature; });
+
+  // Try replace the existing corpus.
+  auto ReplaceII = [CodeFeatureHash]() -> InputInfo * {
+    auto &MT = TPC.MemoryTrace;
+    for (auto F : MT.CurrentDiscovery)
+      if (auto *ExistingII = MT.CorpusMap[F])
+        if (ExistingII->FeatureHash == CodeFeatureHash) return ExistingII;
+    return nullptr;
+  }();
+  if (ReplaceII) {
+    ReplaceCorpus(ReplaceII);
+    MarkDataFeatures(ReplaceII, TPC.MemoryTrace.CurrentDiscovery);
+    return true;
+  }
+
+  // Add to corpus.
+  TPC.UpdateObservedPCs();
+  InputInfo *NewII = Corpus.AddToCorpus(
+      {Data, Data + Size}, NumNewCodeFeatures, CodeFeatureHash, MayDeleteFile,
+      TPC.ObservedFocusFunction(), ForceAddToCorpus, TimeOfUnit,
+      UniqFeatureSetTmp, DFT, II);
+  WriteFeatureSetToFile(Options.FeaturesDir, Sha1ToString(NewII->Sha1),
+                        NewII->UniqFeatureSet);
+  WriteEdgeToMutationGraphFile(Options.MutationGraphFile, NewII, II,
+                               MD.MutationSequence());
+  MarkDataFeatures(NewII, TPC.MemoryTrace.CurrentDiscovery);
+  return true;
+}
+
+size_t Fuzzer::DetectCodeFeatures(size_t Size, InputInfo *II,
+                                  bool &MayReduceParent,
+                                  bool *FoundUniqueFeatures) {
   UniqFeatureSetTmp.clear();
   size_t FoundUniqFeaturesOfII = 0;
   size_t NumUpdatesBefore = Corpus.NumFeatureUpdates();
+
   TPC.CollectFeatures([&](uint32_t Feature) {
     if (Corpus.AddFeature(Feature, static_cast<uint32_t>(Size), Options.Shrink))
       UniqFeatureSetTmp.push_back(Feature);
-    if (Options.Entropic)
-      Corpus.UpdateFeatureFrequency(II, Feature);
+    if (Options.Entropic) Corpus.UpdateFeatureFrequency(II, Feature);
     if (Options.ReduceInputs && II && !II->NeverReduce)
       if (std::binary_search(II->UniqFeatureSet.begin(),
                              II->UniqFeatureSet.end(), Feature))
         FoundUniqFeaturesOfII++;
   });
+  if (FoundUniqueFeatures) *FoundUniqueFeatures = FoundUniqFeaturesOfII;
 
-  auto &MT = TPC.MemoryTrace;
-  auto HasMemoryDiscovery = !MT.CurrentDiscovery.empty();
-  if (FoundUniqFeatures)
-    *FoundUniqFeatures = FoundUniqFeaturesOfII || HasMemoryDiscovery;
-  PrintPulseAndReportSlowInput(Data, Size);
-  size_t NumNewFeatures = Corpus.NumFeatureUpdates() - NumUpdatesBefore;
-
-  // Update hash if necessary.
-  size_t FeatureHash = 0;
-  if (HasMemoryDiscovery || NumNewFeatures || ForceAddToCorpus) {
-    TPC.CollectFeatures(
-        [&](uint32_t Feature) { FeatureHash = (FeatureHash << 1) ^ Feature; });
-  }
-
-  InputInfo *NewII = nullptr;
-  auto AddToCorpus = [&]() {
-    if (NewII) return NewII;
-    TPC.UpdateObservedPCs();
-    NewII = Corpus.AddToCorpus({Data, Data + Size}, NumNewFeatures, FeatureHash,
-                               MayDeleteFile, TPC.ObservedFocusFunction(),
-                               ForceAddToCorpus, TimeOfUnit, UniqFeatureSetTmp,
-                               DFT, II);
-    WriteFeatureSetToFile(Options.FeaturesDir, Sha1ToString(NewII->Sha1),
-                          NewII->UniqFeatureSet);
-    WriteEdgeToMutationGraphFile(Options.MutationGraphFile, NewII, II,
-                                 MD.MutationSequence());
-    return NewII;
-  };
-
-  if (HasMemoryDiscovery) {
-    for (auto I : MT.CurrentDiscovery) {
-      if (auto *ExistingII = MT.CorpusMap[I]) {
-        if (ExistingII->FeatureHash == FeatureHash) {
-          // TODO maybe the existing input has multiple references inside the slot.
-          Corpus.Replace(ExistingII, {Data, Data + Size}, TimeOfUnit);
-        } else {
-          MT.CorpusMap[I] = AddToCorpus();
-        }
-      } else {
-        MT.CorpusMap[I] = AddToCorpus();
-      }
-    }
-  }
-
-  if (NumNewFeatures || ForceAddToCorpus)
-    AddToCorpus();
-  if (NewII)
-    return true;
-
-  // Try replace the parent corpus.
-  if (II && FoundUniqFeaturesOfII &&
-      II->DataFlowTraceForFocusFunction.empty() &&
-      FoundUniqFeaturesOfII == II->UniqFeatureSet.size() &&
-      II->U.size() > Size) {
-    auto OldFeaturesFile = Sha1ToString(II->Sha1);
-    Corpus.Replace(II, {Data, Data + Size}, TimeOfUnit);
-    RenameFeatureSetFile(Options.FeaturesDir, OldFeaturesFile,
-                         Sha1ToString(II->Sha1));
-    return true;
-  }
-  return false;
+  MayReduceParent = II && FoundUniqFeaturesOfII &&
+                    II->DataFlowTraceForFocusFunction.empty() &&
+                    FoundUniqFeaturesOfII == II->UniqFeatureSet.size() &&
+                    II->U.size() > Size;
+  return Corpus.NumFeatureUpdates() - NumUpdatesBefore;
 }
 
 void Fuzzer::TPCUpdateObservedPCs() { TPC.UpdateObservedPCs(); }

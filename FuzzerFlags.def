@@ -28,7 +28,7 @@ FUZZER_FLAG_INT(keep_seed, 0, "If 1, keep seed inputs in the corpus even if "
   "seed inputs will never be reduced. This option can be useful when seeds are"
   "not properly formed for the fuzz target but still have useful snippets.")
 FUZZER_FLAG_INT(cross_over, 1, "If 1, cross over inputs.")
-FUZZER_FLAG_INT(cross_over_uniform_dist, 0, "Experimental. If 1, use a "
+FUZZER_FLAG_INT(cross_over_uniform_dist, 1, "Experimental. If 1, use a "
   "uniform probability distribution when choosing inputs to cross over with. "
   "Some of the inputs in the corpus may never get chosen for mutation "
   "depending on the input mutation scheduling policy. With this flag, all "
@@ -194,7 +194,7 @@ FUZZER_FLAG_INT(entropic_number_of_rarest_features, 100, "Experimental. If "
      "entropic is enabled, we keep track of the frequencies only for the "
      "Top-X least abundant features (union features that are considered as "
      "rare).")
-FUZZER_FLAG_INT(entropic_scale_per_exec_time, 0, "Experimental. If 1, "
+FUZZER_FLAG_INT(entropic_scale_per_exec_time, 1, "Experimental. If 1, "
      "the Entropic power schedule gets scaled based on the input execution "
      "time. Inputs with lower execution time get scheduled more (up to 30x). "
      "Note that, if 1, fuzzer stops from being deterministic even if a "

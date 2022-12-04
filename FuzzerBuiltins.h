@@ -17,6 +17,7 @@
 #include <cstdint>
 
 #define GET_CALLER_PC() __builtin_return_address(0)
+#define GET_CALLER_PC_INT() reinterpret_cast<uintptr_t>(GET_CALLER_PC())
 
 namespace fuzzer {
 
