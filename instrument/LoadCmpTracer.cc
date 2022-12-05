@@ -220,6 +220,8 @@ struct LoadCmpTracerPass : public PassInfoMixin<LoadCmpTracerPass> {
   }
 
   bool instrumentSwitch(Module &M, SwitchInst *SI) {
+    if (SI->getNumCases() == 0) return false;
+
     IRBuilder<> IRB(SI);
     auto *Cond = SI->getCondition();
     auto &DL = SI->getModule()->getDataLayout();
